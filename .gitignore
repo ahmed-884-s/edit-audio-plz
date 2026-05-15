@@ -1,6 +1,6 @@
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.egg-info/
 .env
-*.tmp
 *.log
+/tmp/
