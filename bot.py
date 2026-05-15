@@ -54,11 +54,6 @@ def check_rate_limit(user_id: int) -> bool:
     return False
 
 
-def remaining_requests(user_id: int) -> int:
-    now  = datetime.now()
-    used = sum(1 for t in _history[user_id] if now - t < RATE_WINDOW)
-    return max(0, RATE_LIMIT - used)
-
 
 # ─────────────────────────── keyboards ──────────────────────────────
 
@@ -119,11 +114,20 @@ HELP_TEXT = (
     "4️⃣ اختار الجودة\n"
     "5️⃣ انتظر التحميل ✅\n\n"
     "⚠️ *ملاحظات:*\n"
-    f"• الحد الأقصى للملف: 50 MB\n"
+    "• الحد الأقصى للملف: 50 MB\n"
     f"• أقصى عدد تحميلات: {RATE_LIMIT} كل 10 دقايق\n"
     "• بعض الفيديوهات ممكن يكون فيها قيود جغرافية\n\n"
     "🆘 أي مشكلة؟ كلّم المطوّر @YourUsername"
 )
+
+
+def _format_duration(secs: int | float | None) -> str:
+    if not secs:
+        return "—"
+    secs = int(secs)
+    h, rem = divmod(secs, 3600)
+    m, s   = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def _qual_label(fmt: str, quality: str) -> str:
@@ -164,7 +168,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     status_msg = await update.message.reply_text("🔍 *جاري فحص الرابط…*", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         info = await loop.run_in_executor(None, get_info, url)
     except Exception as exc:
         logger.warning("get_info failed for %s: %s", url, exc)
@@ -236,14 +240,14 @@ async def cb_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await query.edit_message_text(
         f"⬇️ *جاري التحميل…*\n\n"
         f"📄 {title}\n"
-        f"🎚 {qlabel}\n\n"
+        f"📐 {qlabel}\n\n"
         f"_ده ممكن ياخد وقت حسب حجم الفيديو_",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     # ── نزّل الملف ──
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         out_path, out_name = await loop.run_in_executor(
             None, download_media, url, fmt, quality
         )
@@ -259,7 +263,7 @@ async def cb_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # ── ابعت الملف ──
     file_size = os.path.getsize(out_path)
     size_mb   = file_size / (1024 * 1024)
-    caption   = f"✅ *{title[:50]}*\n🎚 {qlabel}  ·  📦 {size_mb:.1f} MB"
+    caption   = f"✅ *{title[:50]}*\n📐 {qlabel}  ·  📦 {size_mb:.1f} MB"
 
     try:
         if file_size > MAX_TG_SIZE:
@@ -296,17 +300,6 @@ async def cb_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if os.path.exists(out_path):
             os.unlink(out_path)
         context.user_data.clear()
-
-
-# ─────────────────────────── utils ──────────────────────────────────
-
-def _format_duration(secs: int | float | None) -> str:
-    if not secs:
-        return "—"
-    secs = int(secs)
-    h, rem = divmod(secs, 3600)
-    m, s   = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 # ─────────────────────────── main ───────────────────────────────────
