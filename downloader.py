@@ -1,103 +1,153 @@
 """
-downloader.py — تحميل الميديا عبر yt-dlp
+downloader.py — wrapper فوق yt-dlp لتحميل الفيديوهات والصوتيات
 """
 
 from __future__ import annotations
 
-import os
-import tempfile
 import logging
+import os
+import re
+import tempfile
 from pathlib import Path
 
 import yt_dlp
 
 logger = logging.getLogger(__name__)
 
-# ───────────────────────────── constants ──────────────────────────────
+TEMP_DIR = Path(tempfile.gettempdir()) / "tg_dl_bot"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-
-_COMMON = {
+# خيارات مشتركة لتقليل الضوضاء في السجلات
+_BASE_OPTS: dict = {
     "quiet":            True,
     "no_warnings":      True,
     "noplaylist":       True,
     "socket_timeout":   30,
-    "retries":          5,
-    "fragment_retries": 5,
-    "http_headers":     {"User-Agent": _UA},
+    "retries":          3,
+    "fragment_retries": 3,
 }
 
-# ───────────────────────────── helpers ────────────────────────────────
 
-def _fmt_duration(secs: int | float | None) -> str:
-    if not secs:
-        return "—"
-    secs = int(secs)
-    h, rem = divmod(secs, 3600)
-    m, s   = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+def _sanitize(name: str, max_len: int = 60) -> str:
+    """يزيل الأحرف غير المسموح بها في أسماء الملفات."""
+    name = re.sub(r'[\\/*?:"<>|]', "", name).strip()
+    return name[:max_len] or "download"
 
 
-def _largest_file(directory: str) -> Path:
-    files = [p for p in Path(directory).iterdir() if p.is_file()]
-    if not files:
-        raise RuntimeError("لم يُنشأ أي ملف بعد التحميل!")
-    return max(files, key=lambda p: p.stat().st_size)
-
-
-# ───────────────────────────── public API ─────────────────────────────
-
+# ══════════════════════════════════════════════
+#  get_info
+# ══════════════════════════════════════════════
 def get_info(url: str) -> dict:
-    """يجيب metadata الفيديو من غير ما ينزّل حاجة."""
-    opts = {**_COMMON, "skip_download": True, "socket_timeout": 20}
+    """
+    يجلب بيانات الفيديو بدون تحميل.
+    يرجع dict يحتوي على: title, uploader, duration, view_count, thumbnail …
+    """
+    opts = {
+        **_BASE_OPTS,
+        "extract_flat": False,
+    }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
+
     return info or {}
 
 
+# ══════════════════════════════════════════════
+#  download_media
+# ══════════════════════════════════════════════
 def download_media(url: str, fmt: str, quality: str) -> tuple[str, str]:
     """
-    ينزّل الميديا ويرجع (file_path, file_name).
+    يحمّل الملف ويرجع (out_path, out_name).
 
-    Parameters
-    ----------
-    url     : رابط الفيديو
-    fmt     : "video" | "audio"
-    quality : "1080" / "720" / "480" / "360"  للفيديو
-              "320"  / "128"                   للصوت
+    fmt: "video" | "audio"
+    quality:
+        video → "2160" | "1440" | "1080" | "720" | "480" | "360"
+        audio → "320"  | "192"  | "128"  | "64"
     """
-    tmp_dir = tempfile.mkdtemp()
-    opts    = {
-        **_COMMON,
-        "outtmpl": os.path.join(tmp_dir, "%(title).80s.%(ext)s"),
-    }
+    out_tmpl = str(TEMP_DIR / "%(id)s.%(ext)s")
 
     if fmt == "audio":
-        opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key":              "FFmpegExtractAudio",
-                "preferredcodec":   "mp3",
-                "preferredquality": quality,
-            }],
-        })
+        opts = _audio_opts(quality, out_tmpl)
     else:
-        opts["format"] = (
-            f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]"
-            f"/bestvideo[height<={quality}]+bestaudio"
-            f"/best[height<={quality}]"
-            "/best"
-        )
-        opts["merge_output_format"] = "mp4"
-
-    logger.info("Downloading %s  fmt=%s  quality=%s", url, fmt, quality)
+        opts = _video_opts(quality, out_tmpl)
 
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.extract_info(url, download=True)
+        info = ydl.extract_info(url, download=True)
 
-    out = _largest_file(tmp_dir)
-    return str(out), out.name
+    if not info:
+        raise RuntimeError("لم يتم استخراج معلومات الفيديو.")
+
+    # تحديد مسار الملف المحمّل
+    out_path = _resolve_path(ydl, info)
+    if not out_path or not os.path.exists(out_path):
+        # fallback: ابحث عن الملف في المجلد المؤقت
+        vid_id = info.get("id", "")
+        matches = list(TEMP_DIR.glob(f"{vid_id}.*"))
+        if not matches:
+            raise FileNotFoundError("لم يُعثر على الملف بعد التحميل.")
+        out_path = str(max(matches, key=lambda p: p.stat().st_size))
+
+    title   = _sanitize(info.get("title") or "download")
+    ext     = Path(out_path).suffix.lstrip(".")
+    out_name = f"{title}.{ext}"
+
+    logger.info("Downloaded — path=%s size=%d", out_path, os.path.getsize(out_path))
+    return out_path, out_name
+
+
+# ══════════════════════════════════════════════
+#  الأوبشنز الخاصة بكل صيغة
+# ══════════════════════════════════════════════
+def _video_opts(quality: str, out_tmpl: str) -> dict:
+    q = int(quality)
+    # نحاول أفضل جودة متاحة <= المطلوبة
+    fmt_selector = (
+        f"bestvideo[height<={q}][ext=mp4]+bestaudio[ext=m4a]"
+        f"/bestvideo[height<={q}]+bestaudio"
+        f"/best[height<={q}]"
+        "/best"
+    )
+    return {
+        **_BASE_OPTS,
+        "format":          fmt_selector,
+        "outtmpl":         out_tmpl,
+        "merge_output_format": "mp4",
+        "postprocessors": [
+            {
+                "key":            "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
+            }
+        ],
+    }
+
+
+def _audio_opts(quality: str, out_tmpl: str) -> dict:
+    return {
+        **_BASE_OPTS,
+        "format":    "bestaudio/best",
+        "outtmpl":   out_tmpl,
+        "postprocessors": [
+            {
+                "key":            "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": quality,
+            }
+        ],
+    }
+
+
+# ══════════════════════════════════════════════
+#  مساعد لتحديد مسار الملف
+# ══════════════════════════════════════════════
+def _resolve_path(ydl: yt_dlp.YoutubeDL, info: dict) -> str | None:
+    try:
+        return ydl.prepare_filename(info)
+    except Exception:
+        pass
+
+    # fallback للملفات المُحوَّلة (مثلاً mp3 بعد extraction)
+    entries = info.get("requested_downloads") or []
+    if entries:
+        return entries[0].get("filepath") or entries[0].get("filename")
+
+    return None
