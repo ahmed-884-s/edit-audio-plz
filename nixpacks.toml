@@ -1,8 +1,10 @@
 [phases.setup]
-nixPkgs = ["python311", "python311Packages.pip", "ffmpeg", "nodePackages.nodejs"]
+nixPkgs = ["python311", "ffmpeg", "nodePackages.nodejs", "curl", "unzip"]
 
 [phases.install]
 cmds = [
+  "python3.11 -m ensurepip --upgrade",
+  "python3.11 -m pip install --upgrade pip",
   "python3.11 -m pip install --upgrade 'yt-dlp[default]' python-telegram-bot",
   "curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh"
 ]
