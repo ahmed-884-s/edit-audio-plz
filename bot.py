@@ -1,6 +1,6 @@
 """
-bot.py — بوت تيليجرام لتحميل الفيديوهات والصوتيات
-يدعم YouTube · Instagram · TikTok · Twitter/X · Facebook · SoundCloud · Vimeo · وأكتر
+bot.py — بوت تيليجرام لتحميل الفيديوهات
+يدعم YouTube · Instagram · TikTok · Twitter/X · Facebook · وأكتر من 1000 موقع
 """
 
 from __future__ import annotations
@@ -8,18 +8,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import tempfile
 from collections import defaultdict
 from datetime import datetime, timedelta
-from pathlib import Path
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -29,145 +22,144 @@ from telegram.ext import (
     filters,
 )
 
-from downloader import download_media, get_info
+from downloader import download_media, get_available_qualities
 
-# ══════════════════════════════════════════════
-#  إعداد الـ Logging
-# ══════════════════════════════════════════════
+# ─────────────────────────── logging ──────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ══════════════════════════════════════════════
-#  الإعدادات العامة
-# ══════════════════════════════════════════════
-RATE_LIMIT   = int(os.getenv("RATE_LIMIT", "5"))       # أقصى عدد تحميلات
-RATE_WINDOW  = timedelta(minutes=int(os.getenv("RATE_WINDOW_MINUTES", "10")))
-MAX_TG_SIZE  = 50 * 1024 * 1024                        # 50 MB حد تيليجرام
-TEMP_DIR     = Path(tempfile.gettempdir()) / "tg_dl_bot"
-TEMP_DIR.mkdir(parents=True, exist_ok=True)
+# ─────────────────────────── إعدادات ──────────────────────────────────────────
+RATE_LIMIT = 5
+RATE_WINDOW = timedelta(minutes=10)
+MAX_TG_SIZE = 50 * 1024 * 1024  # 50 MB
 
-VIDEO_QUALITIES = ["2160", "1440", "1080", "720", "480", "360"]
-AUDIO_QUALITIES = ["320", "192", "128", "64"]
-
-# ══════════════════════════════════════════════
-#  Rate Limiter
-# ══════════════════════════════════════════════
+# ─────────────────────────── rate limiter ─────────────────────────────────────
 _history: dict[int, list[datetime]] = defaultdict(list)
 
-def check_rate_limit(user_id: int) -> tuple[bool, int]:
-    """
-    يرجع (exceeded, remaining_seconds).
-    exceeded=True لو المستخدم تجاوز الحد.
-    """
+
+def check_rate_limit(user_id: int) -> bool:
     now = datetime.now()
     hist = [t for t in _history[user_id] if now - t < RATE_WINDOW]
     _history[user_id] = hist
-
     if len(hist) >= RATE_LIMIT:
-        oldest = min(hist)
-        wait = int((oldest + RATE_WINDOW - now).total_seconds()) + 1
-        return True, wait
-
+        return True
     _history[user_id].append(now)
-    return False, 0
+    return False
 
-# ══════════════════════════════════════════════
-#  Keyboards
-# ══════════════════════════════════════════════
+
+# ─────────────────────────── لوحات المفاتيح ───────────────────────────────────
 def _cancel_btn() -> InlineKeyboardButton:
     return InlineKeyboardButton("❌ إلغاء", callback_data="cancel")
 
-def format_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🎬 فيديو  MP4", callback_data="fmt:video"),
-            InlineKeyboardButton("🎵 صوت  MP3",  callback_data="fmt:audio"),
-        ],
-        [_cancel_btn()],
-    ])
 
-def quality_keyboard(fmt: str, available: list[str] | None = None) -> InlineKeyboardMarkup:
-    if fmt == "audio":
-        options = [
-            ("🔊 320 kbps — عالية جداً", "q:audio:320"),
-            ("🔉 192 kbps — عالية",       "q:audio:192"),
-            ("🔈 128 kbps — متوسطة",      "q:audio:128"),
-            ("📻  64 kbps — منخفضة",      "q:audio:64"),
-        ]
-    else:
-        options = [
-            ("🔵 2160p — 4K",    "q:video:2160"),
-            ("🟣 1440p — 2K",    "q:video:1440"),
-            ("🟢 1080p — FHD",   "q:video:1080"),
-            ("🟡  720p — HD",    "q:video:720"),
-            ("🟠  480p — SD",    "q:video:480"),
-            ("🔴  360p — منخفضة","q:video:360"),
-        ]
-
-    rows: list[list[InlineKeyboardButton]] = []
-    pair: list[InlineKeyboardButton] = []
-    for label, data in options:
-        pair.append(InlineKeyboardButton(label, callback_data=data))
-        if len(pair) == 2:
-            rows.append(pair)
-            pair = []
-    if pair:
-        rows.append(pair)
-
+def format_keyboard(has_video: bool, has_audio: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if has_video:
+        rows.append([InlineKeyboardButton("🎬 فيديو MP4", callback_data="fmt:video")])
+    if has_audio:
+        rows.append([InlineKeyboardButton("🎵 صوت MP3", callback_data="fmt:audio")])
     rows.append([_cancel_btn()])
     return InlineKeyboardMarkup(rows)
 
-# ══════════════════════════════════════════════
-#  نصوص الرسائل
-# ══════════════════════════════════════════════
-START_TEXT = (
-    "👋 *أهلاً بك في Video & Audio Downloader Bot*\n\n"
-    "🔗 ابعت أي رابط وهنزّله ليك فوراً!\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━\n"
-    "📺 *المواقع المدعومة:*\n"
-    "YouTube · Instagram · TikTok\n"
-    "Twitter/X · Facebook · SoundCloud\n"
-    "Vimeo · Dailymotion · وأكتر من 1000 موقع\n\n"
-    "🎬 *فيديو:*  4K · 2K · 1080p · 720p · 480p · 360p\n"
-    "🎵 *صوت:*  320k · 192k · 128k · 64k\n"
-    "━━━━━━━━━━━━━━━━━━━━━\n\n"
-    "👇 ابعت الرابط دلوقتي!"
-)
 
-HELP_TEXT = (
-    "📖 *طريقة الاستخدام:*\n\n"
-    "1️⃣  انسخ رابط الفيديو\n"
-    "2️⃣  ابعته هنا مباشرةً\n"
-    "3️⃣  اختار الصيغة: فيديو MP4 أو صوت MP3\n"
-    "4️⃣  اختار الجودة المناسبة\n"
-    "5️⃣  انتظر التحميل ✅\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━\n"
-    "⚠️ *ملاحظات مهمة:*\n\n"
-    "• الحد الأقصى لحجم الملف: *50 MB*\n"
-    f"• أقصى عدد تحميلات: *{RATE_LIMIT}* كل 10 دقايق لكل مستخدم\n"
-    "• بعض الفيديوهات قد تكون محمية أو غير متاحة جغرافياً\n"
-    "• إذا طلبت جودة غير متاحة، ستحصل على أعلى جودة ممكنة\n\n"
-    "━━━━━━━━━━━━━━━━━━━━━\n"
-    "🆘 مشكلة؟ تواصل مع المطوّر: @YourUsername"
-)
+def video_quality_keyboard(qualities: list[str]) -> InlineKeyboardMarkup:
+    """يعرض الجودات المتاحة فعلاً من الفيديو."""
+    LABELS = {
+        "2160": "🔵 4K — 2160p",
+        "1440": "🟣 2K — 1440p",
+        "1080": "🔵 Full HD — 1080p",
+        "720":  "🟢 HD — 720p",
+        "480":  "🟡 480p",
+        "360":  "🔴 360p",
+        "240":  "⚪ 240p",
+    }
 
-# ══════════════════════════════════════════════
-#  أدوات مساعدة
-# ══════════════════════════════════════════════
-def _fmt_duration(secs: int | float | None) -> str:
+    btns = []
+    row = []
+    for q in qualities:
+        label = LABELS.get(q, f"📹 {q}p")
+        row.append(InlineKeyboardButton(label, callback_data=f"q:video:{q}"))
+        if len(row) == 2:
+            btns.append(row)
+            row = []
+    if row:
+        btns.append(row)
+
+    btns.append([_cancel_btn()])
+    return InlineKeyboardMarkup(btns)
+
+
+def audio_quality_keyboard(qualities: list[str]) -> InlineKeyboardMarkup:
+    LABELS = {
+        "320": "🔊 جودة عالية — 320 kbps",
+        "128": "🔉 جودة متوسطة — 128 kbps",
+    }
+    btns = [
+        [InlineKeyboardButton(LABELS.get(q, f"🎵 {q} kbps"), callback_data=f"q:audio:{q}")]
+        for q in qualities
+    ]
+    btns.append([_cancel_btn()])
+    return InlineKeyboardMarkup(btns)
+
+
+# ─────────────────────────── نصوص ─────────────────────────────────────────────
+START_TEXT = """
+🎬 *Video Downloader Bot*
+
+أهلاً بك! ابعتلي أي رابط فيديو وأنا هحمله ليك على طول 🚀
+
+━━━━━━━━━━━━━━━━━━
+📌 *المواقع المدعومة:*
+YouTube · Instagram · TikTok
+Twitter/X · Facebook · Vimeo
+SoundCloud · وأكتر من 1000 موقع
+
+🎬 *صيغ التحميل:*
+MP4 فيديو | MP3 صوت
+
+📐 *الجودات تتحدد حسب كل فيديو*
+━━━━━━━━━━━━━━━━━━
+
+ابعت الرابط دلوقتي 👇
+""".strip()
+
+HELP_TEXT = """
+📖 *طريقة الاستخدام:*
+
+1️⃣ انسخ رابط أي فيديو
+2️⃣ ابعته للبوت مباشرةً
+3️⃣ اختار الصيغة (فيديو أو صوت)
+4️⃣ اختار الجودة من المتاح
+5️⃣ انتظر وهتلاقي الملف ✅
+
+━━━━━━━━━━━━━━━━━━
+⚠️ *ملاحظات مهمة:*
+
+• 📦 الحد الأقصى للملف: *50 MB*
+• ⏱ أقصى عدد تحميلات: *{RATE_LIMIT} كل 10 دقايق*
+• 🌍 بعض الفيديوهات ممكن تكون محظورة جغرافياً
+• 🔒 الفيديوهات الخاصة أو المحذوفة مش ممكن تتحمّل
+━━━━━━━━━━━━━━━━━━
+
+/start — الرسالة الترحيبية
+/help — هذه الرسالة
+""".strip().replace("{RATE_LIMIT}", str(RATE_LIMIT))
+
+
+def _fmt_duration(secs) -> str:
     if not secs:
         return "—"
     secs = int(secs)
-    h, rem = divmod(secs, 3600)
-    m, s   = divmod(rem, 60)
+    h, r = divmod(secs, 3600)
+    m, s = divmod(r, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
-def _fmt_views(n: int | None) -> str:
-    if n is None:
+
+def _fmt_views(n) -> str:
+    if not n:
         return "—"
     if n >= 1_000_000:
         return f"{n/1_000_000:.1f}M"
@@ -175,25 +167,13 @@ def _fmt_views(n: int | None) -> str:
         return f"{n/1_000:.1f}K"
     return str(n)
 
-def _fmt_size(b: int) -> str:
-    if b >= 1024**2:
-        return f"{b/1024**2:.1f} MB"
-    return f"{b/1024:.0f} KB"
 
 def _qual_label(fmt: str, quality: str) -> str:
     return f"{quality}p" if fmt == "video" else f"{quality} kbps"
 
-def _sanitize_filename(name: str) -> str:
-    """يحذف الأحرف غير المسموح بها في أسماء الملفات."""
-    import re
-    return re.sub(r'[\\/*?:"<>|]', "", name).strip()[:80]
 
-# ══════════════════════════════════════════════
-#  الـ Handlers
-# ══════════════════════════════════════════════
+# ─────────────────────────── Handlers ─────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    logger.info("START — user=%s (%s)", user.id, user.username)
     await update.message.reply_text(START_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -202,79 +182,90 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    url     = update.message.text.strip()
-    user    = update.effective_user
-    user_id = user.id
+    url = update.message.text.strip()
+    user_id = update.effective_user.id
 
-    # ── تحقق من صحة الرابط ──
+    # ── تحقق من الرابط ────────────────────────────────────────────────────
     if not url.startswith(("http://", "https://")):
         await update.message.reply_text(
-            "⚠️ *رابط غير صالح*\n\nابعت رابط يبدأ بـ `https://`",
+            "⚠️ *رابط غير صحيح*\n\nابعت رابط يبدأ بـ `https://`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    # ── Rate Limit ──
-    exceeded, wait_secs = check_rate_limit(user_id)
-    if exceeded:
-        mins, secs = divmod(wait_secs, 60)
-        wait_str = f"{mins}:{secs:02d} دقيقة" if mins else f"{secs} ثانية"
+    # ── تحقق من rate limit ────────────────────────────────────────────────
+    if check_rate_limit(user_id):
         await update.message.reply_text(
-            f"⏳ *تجاوزت الحد المسموح*\n\n"
-            f"الحد المسموح: {RATE_LIMIT} تحميلات كل 10 دقايق.\n"
-            f"انتظر: *{wait_str}* ثم حاول مجدداً 😊",
+            f"⏳ *وصلت للحد المسموح*\n\n"
+            f"ممكن تعمل {RATE_LIMIT} تحميلات كل 10 دقايق فقط.\n"
+            "استنّى شوية وحاول تاني 😊",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    logger.info("URL received — user=%s url=%s", user_id, url[:60])
-
-    # ── جلب معلومات الفيديو ──
-    status = await update.message.reply_text(
-        "🔍 *جاري فحص الرابط…*\n_قد يستغرق بضع ثوانٍ_",
+    # ── جلب معلومات الفيديو ───────────────────────────────────────────────
+    status_msg = await update.message.reply_text(
+        "🔍 *جاري فحص الرابط…*\n_ده ممكن ياخد ثواني_",
         parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
         loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, get_info, url)
+        data = await loop.run_in_executor(None, get_available_qualities, url)
     except Exception as exc:
-        logger.warning("get_info failed — user=%s url=%s err=%s", user_id, url[:60], exc)
-        await status.edit_text(
-            "❌ *تعذّر قراءة الرابط*\n\n"
-            "• تأكد إن الرابط صحيح\n"
-            "• الفيديو مش خاص أو محذوف\n"
-            "• جرّب مرة تانية بعد قليل",
+        logger.warning("get_available_qualities failed: %s", exc)
+        err_str = str(exc)
+        # رسائل خطأ مفيدة حسب نوع المشكلة
+        if "Sign in" in err_str or "bot" in err_str.lower():
+            hint = "⛔ يوتيوب طالب تسجيل دخول.\nجرّب بعد دقايق أو جرّب رابط من موقع تاني."
+        elif "Private" in err_str or "private" in err_str:
+            hint = "🔒 الفيديو خاص أو محذوف."
+        elif "Unsupported" in err_str or "unsupported" in err_str:
+            hint = "❌ الموقع ده مش مدعوم."
+        elif "404" in err_str or "not found" in err_str.lower():
+            hint = "🔎 الفيديو مش موجود أو الرابط غلط."
+        else:
+            hint = f"_تفاصيل: `{err_str[:150]}`_"
+        await status_msg.edit_text(
+            f"❌ *تعذّر قراءة الرابط*\n\n{hint}",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    # ── تجهيز المعلومات ──
-    title    = _sanitize_filename(info.get("title") or "بدون عنوان")
-    uploader = info.get("uploader") or info.get("channel") or "—"
-    dur_str  = _fmt_duration(info.get("duration"))
-    view_str = _fmt_views(info.get("view_count"))
-    thumb    = info.get("thumbnail")
-
+    # ── خزّن البيانات ─────────────────────────────────────────────────────
     context.user_data.update({
-        "url":      url,
-        "title":    title,
-        "uploader": uploader,
-        "thumb":    thumb,
+        "url": url,
+        "title": data["title"],
+        "uploader": data["uploader"],
+        "video_qualities": data["video"],
+        "audio_qualities": data["audio"],
     })
 
+    # ── كوّن رسالة المعلومات ──────────────────────────────────────────────
+    dur = _fmt_duration(data.get("duration"))
+    views = _fmt_views(data.get("view_count"))
+    title = data["title"]
+    uploader = data["uploader"]
+
+    # عرض الجودات المتاحة
+    vq = " · ".join(f"{q}p" for q in data["video"]) if data["video"] else "—"
+    aq = " · ".join(f"{q}k" for q in data["audio"]) if data["audio"] else "—"
+
     info_text = (
-        f"🎬 *{title}*\n\n"
+        f"🎬 *{title}*\n"
         f"👤 {uploader}\n"
-        f"⏱ المدة: {dur_str}   👁 المشاهدات: {view_str}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📥 اختار صيغة التحميل:"
+        f"⏱ {dur}  👁 {views}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📹 *جودات الفيديو المتاحة:* {vq}\n"
+        f"🎵 *جودات الصوت:* {aq}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📥 اختار الصيغة:"
     )
 
-    await status.edit_text(
+    await status_msg.edit_text(
         info_text,
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=format_keyboard(),
+        reply_markup=format_keyboard(bool(data["video"]), bool(data["audio"])),
     )
 
 
@@ -284,22 +275,29 @@ async def cb_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if query.data == "cancel":
         context.user_data.clear()
-        await query.edit_message_text("❌ *تم إلغاء العملية.*", parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text("❌ *تم الإلغاء*", parse_mode=ParseMode.MARKDOWN)
         return
 
-    fmt   = query.data.split(":")[1]
-    title = context.user_data.get("title", "—")
+    fmt = query.data.split(":")[1]
     context.user_data["fmt"] = fmt
+    title = context.user_data.get("title", "—")
 
-    fmt_name = "فيديو MP4 🎬" if fmt == "video" else "صوت MP3 🎵"
+    if fmt == "video":
+        qualities = context.user_data.get("video_qualities", ["1080", "720", "480", "360"])
+        kb = video_quality_keyboard(qualities)
+        fmt_label = "🎬 فيديو MP4"
+    else:
+        qualities = context.user_data.get("audio_qualities", ["320", "128"])
+        kb = audio_quality_keyboard(qualities)
+        fmt_label = "🎵 صوت MP3"
 
     await query.edit_message_text(
         f"*{title}*\n\n"
-        f"الصيغة المختارة: {fmt_name}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📐 اختار الجودة:",
+        f"الصيغة: {fmt_label}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📐 *اختار الجودة:*",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=quality_keyboard(fmt),
+        reply_markup=kb,
     )
 
 
@@ -309,82 +307,90 @@ async def cb_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if query.data == "cancel":
         context.user_data.clear()
-        await query.edit_message_text("❌ *تم إلغاء العملية.*", parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text("❌ *تم الإلغاء*", parse_mode=ParseMode.MARKDOWN)
         return
 
     _, fmt, quality = query.data.split(":")
-    url   = context.user_data.get("url")
+    url = context.user_data.get("url")
     title = context.user_data.get("title", "—")
 
     if not url:
         await query.edit_message_text(
-            "❌ *حدث خطأ*\n\nابعت الرابط مجدداً.",
+            "❌ *انتهت الجلسة*\n\nابعت الرابط تاني من الأول.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     qlabel = _qual_label(fmt, quality)
-    user_id = update.effective_user.id
-    logger.info("Downloading — user=%s fmt=%s quality=%s url=%s", user_id, fmt, quality, url[:60])
 
     await query.edit_message_text(
         f"⬇️ *جاري التحميل…*\n\n"
         f"📄 {title}\n"
-        f"📐 الجودة: {qlabel}\n\n"
-        f"_قد يستغرق ذلك بعض الوقت حسب حجم الملف…_",
+        f"📐 {qlabel}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"_ده ممكن ياخد وقت حسب حجم الملف_",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # ── تحميل الملف ──
-    out_path = out_name = None
+    # ── تحميل الملف ──────────────────────────────────────────────────────
     try:
         loop = asyncio.get_running_loop()
         out_path, out_name = await loop.run_in_executor(
             None, download_media, url, fmt, quality
         )
     except Exception as exc:
-        logger.error("Download failed — user=%s err=%s", user_id, exc)
-        await query.message.reply_text(
-            "❌ *فشل التحميل*\n\n"
-            f"السبب: `{str(exc)[:200]}`\n\n"
-            "💡 *اقتراحات:*\n"
-            "• جرّب جودة أقل\n"
-            "• تأكد إن الرابط لا يزال صالحاً\n"
-            "• حاول مرة أخرى بعد قليل",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        logger.error("Download failed: %s", exc)
+        err_str = str(exc)
+        if "Sign in" in err_str or "bot" in err_str.lower():
+            msg = "⛔ يوتيوب بلوك السيرفر.\nحاول تاني بعد شوية أو جرّب جودة تانية."
+        elif "No space" in err_str:
+            msg = "💾 مساحة التخزين المؤقتة امتلأت.\nحاول تاني بعد لحظة."
+        else:
+            msg = f"❌ *فشل التحميل*\n\n`{err_str[:200]}`"
+        await query.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
         context.user_data.clear()
         return
 
-    # ── إرسال الملف ──
-    try:
-        file_size = os.path.getsize(out_path)
+    # ── إرسال الملف ───────────────────────────────────────────────────────
+    file_size = os.path.getsize(out_path)
+    size_mb = file_size / (1024 * 1024)
+    caption = f"✅ *{title[:50]}*\n📐 {qlabel}  |  📦 {size_mb:.1f} MB"
 
+    try:
         if file_size > MAX_TG_SIZE:
+            # عرض جودات أقل كبديل
+            lower_q = [
+                q for q in context.user_data.get("video_qualities", [])
+                if fmt == "video" and int(q) < int(quality)
+            ]
+            extra = ""
+            if lower_q:
+                extra = "\n\nجرّب جودة أقل 👇"
+                kb = video_quality_keyboard(lower_q)
+            else:
+                kb = None
+
+            msg = (
+                f"⚠️ *الملف كبير جداً!*\n\n"
+                f"الحجم: {size_mb:.1f} MB\n"
+                f"الحد المسموح: 50 MB\n"
+                f"{extra}"
+            )
             await query.message.reply_text(
-                f"⚠️ *الملف كبير جداً*\n\n"
-                f"الحجم: *{_fmt_size(file_size)}* (الحد: 50 MB)\n\n"
-                "💡 جرّب جودة أقل:",
+                msg,
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=quality_keyboard(fmt),
+                reply_markup=kb,
             )
             return
 
-        caption = (
-            f"✅ *{title[:50]}*\n\n"
-            f"📐 {qlabel}  •  📦 {_fmt_size(file_size)}\n"
-            f"🤖 @YourBotUsername"
-        )
-        send_kwargs = dict(
-            caption=caption,
-            parse_mode=ParseMode.MARKDOWN,
-            filename=out_name,
-            write_timeout=300,
-            read_timeout=300,
-            connect_timeout=60,
-        )
-
         with open(out_path, "rb") as fh:
+            send_kwargs = dict(
+                filename=out_name,
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN,
+                write_timeout=300,
+                read_timeout=300,
+            )
             if fmt == "audio":
                 await query.message.reply_audio(audio=fh, **send_kwargs)
             else:
@@ -392,34 +398,19 @@ async def cb_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     video=fh, supports_streaming=True, **send_kwargs
                 )
 
-        logger.info("Sent successfully — user=%s size=%s", user_id, _fmt_size(file_size))
-
-    except TelegramError as exc:
-        logger.error("Telegram send error — user=%s err=%s", user_id, exc)
+    except Exception as exc:
+        logger.error("Send failed: %s", exc)
         await query.message.reply_text(
-            "❌ *حصل خطأ أثناء الإرسال*\n\nحاول مجدداً بعد قليل.",
+            "❌ *حصل خطأ أثناء الإرسال*\n\nحاول تاني بعد شوية.",
             parse_mode=ParseMode.MARKDOWN,
         )
     finally:
-        if out_path and os.path.exists(out_path):
+        if os.path.exists(out_path):
             os.unlink(out_path)
         context.user_data.clear()
 
 
-async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يتعامل مع الأوامر غير المعروفة."""
-    await update.message.reply_text(
-        "❓ أمر غير معروف.\n\n"
-        "ابعت /help لمعرفة طريقة الاستخدام، أو ابعت رابط الفيديو مباشرةً.",
-    )
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Unhandled error: %s", context.error, exc_info=context.error)
-
-# ══════════════════════════════════════════════
-#  الدالة الرئيسية
-# ══════════════════════════════════════════════
+# ─────────────────────────── main ─────────────────────────────────────────────
 def main() -> None:
     token = os.environ.get("BOT_TOKEN")
     if not token:
@@ -435,22 +426,14 @@ def main() -> None:
         .build()
     )
 
-    # Handlers
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help",  cmd_help))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    app.add_handler(MessageHandler(filters.COMMAND, handle_unknown))
-    app.add_handler(CallbackQueryHandler(cb_format,  pattern=r"^(fmt:|cancel$)"))
+    app.add_handler(CallbackQueryHandler(cb_format, pattern=r"^(fmt:|cancel$)"))
     app.add_handler(CallbackQueryHandler(cb_quality, pattern=r"^q:"))
 
-    # Error handler
-    app.add_error_handler(error_handler)
-
-    logger.info("✅ البوت بدأ التشغيل")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    logger.info("✅ البوت شغّال")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
