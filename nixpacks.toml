@@ -1,2 +1,13 @@
 [phases.setup]
-nixPkgs = ["ffmpeg", "python311"]
+nixPkgs = ["python311", "ffmpeg", "nodePackages.nodejs"]
+
+[phases.install]
+cmds = [
+  # ثبّت yt-dlp[default] مع كل الاختياريات
+  "pip install 'yt-dlp[default]' python-telegram-bot --upgrade",
+  # ثبّت Deno (JS runtime مطلوب لـ YouTube n-challenge)
+  "curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh"
+]
+
+[start]
+cmd = "python bot.py"
